@@ -4,388 +4,320 @@ import time
 import json
 import serial
 import serial.tools.list_ports
-import platform # 用於偵測作業系統
+import platform
+import threading
+from pynput import keyboard  # <--- ADDED: Import keyboard listener
 
-# 嘗試從 HSV.py 匯入必要的類別。
-# 假設 HSV.py 中定義了 SerialCommunication 和 OpenCVThread 類別。
-# 如果 HSV.py 還有其他您希望共享的常數或函數，也可以在這裡匯入。
+# --- Import necessary classes from the GUI application file ---
 try:
-    from HSV import SerialCommunication, OpenCVThread
-    # 由於原 HSV.py 主要是 GUI，可能沒有明確定義競賽狀態常數，
-    # 這些將在這裡定義。
-except ImportError as e:
-    print(f"錯誤：無法從 HSV.py 匯入必要的類別。請確認 HSV.py 的名稱和路徑正確，且其內部定義了 SerialCommunication 和 OpenCVThread 類別。錯誤訊息: {e}")
-    print("請確保 HSV.py 在本程式碼的同一個目錄下，或者在 Python 的模組搜索路徑中。")
+    from HSV11 import SerialCommunication, ColorProfile
+except ImportError:
+    print("Error: Could not import from HSV11.py.")
+    print("Please ensure 'HSV11.py' is in the same directory as this script.")
     exit()
 
-# --- 顏色設定檔類別定義 ---
-# 這個類別用於解析和儲存從 JSON 檔案載入的顏色範圍資訊
-class ColorProfile:
-    def __init__(self, name, c1_min=0, c1_max=179, c2_min=0, c2_max=255, c3_min=0, c3_max=255, color_hex="#FFFFFF"):
-        self.name = name
-        self.c1_min = c1_min
-        self.c1_max = c1_max
-        self.c2_min = c2_min
-        self.c2_max = c2_max
-        self.c3_min = c3_min
-        self.c3_max = c3_max
-        self.color_hex = color_hex
-        self.active = True
+# --- Competition Parameters & Settings ---
+CAMERA_INDEX = 0
+COLOR_RANGE_FILE = "sprint.json"
+SERIAL_PORT = None 
+BAUDRATE = 1000000
 
-    def to_dict(self):
-        return {
-            "name": self.name,
-            "c1_min": self.c1_min, "c1_max": self.c1_max,
-            "c2_min": self.c2_min, "c2_max": self.c2_max,
-            "c3_min": self.c3_min, "c3_max": self.c3_max,
-            "color_hex": self.color_hex,
-            "active": self.active
-        }
+# --- Thresholds and Movement Parameters ---
+TARGET_AREA_THRESHOLD_STOP = 25000 
+REVERSE_DURATION_S = 2
 
-    @classmethod
-    def from_dict(cls, data):
-        profile = cls(
-            name=data.get("name", "Unnamed"),
-            c1_min=data.get("c1_min", 0),
-            c1_max=data.get("c1_max", 179),
-            c2_min=data.get("c2_min", 0),
-            c2_max=data.get("c2_max", 255),
-            c3_min=data.get("c3_min", 0),
-            c3_max=data.get("c3_max", 255),
-            color_hex=data.get("color_hex", "#FFFFFF")
-        )
-        profile.active = data.get("active", True)
-        return profile
+# --- Robot Movement Parameters ---
+FORWARD_SPEED = 35
+MAX_TURN_SPEED = 15
+REVERSE_SPEED = -20
 
-# --- 競賽參數與設定 ---
-CAMERA_INDEX = 0  # 請依實際情況調整攝影機索引
-COLOR_RANGE_FILE = "sprint.json" # 儲存目標顏色設定檔的檔案名稱
-SERIAL_PORT ="/dev/ttyACM0" # 例如 "COM3" (Windows) 或 "/dev/ttyUSB0" (Linux/macOS)
-                    # 設為 None 時，程式會嘗試列出可用串口供選擇，但競賽模式通常需要預設。
-BAUDRATE = 1000000 # 機器人通訊鮑率
+# --- Competition State Definitions ---
+STATE_IDLE = 0
+STATE_SEARCHING = 1
+STATE_FORWARD_RUN = 2
+STATE_REACHED_TARGET = 3
+STATE_BACKWARD_RUN = 4
+STATE_COMPLETED = 5
 
-# 目標尺寸閾值 (像素面積)
-# 當目標面積達到這個值時，機器人會認為足夠接近
-TARGET_AREA_THRESHOLD_STOP = 20000 # 假設目標大於20000像素面積時停止前進
-
-# 機器人步長和角度參數
-INITIAL_FORWARD_STEP = 50       # 初始前進步長
-MIN_FORWARD_STEP = 5            # 最小前進步長 (避免完全停止前進)
-REVERSE_STEP = -30              # 後退步長 (負號表示後退)
-MAX_TURN_ANGLE = 10             # 最大轉彎角度 (左右轉的最大角度)
-MAX_SIDE_STEP = 20              # 最大平行走步長 (左右平移的最大步長)
-
-# 停止後退的條件
-REVERSE_DURATION = 10 # 後退3秒鐘 (可根據實際比賽規則調整)
-
-# --- 競賽狀態定義 ---
-# 這些狀態將幫助機器人管理其行為流程
-SPRINT_STATE_IDLE = 0            # 閒置/等待開始
-SPRINT_STATE_FORWARD_RUN = 1     # 向前追蹤目標
-SPRINT_STATE_REACHED_TARGET = 2  # 已達到目標 (準備後退)
-SPRINT_STATE_BACKWARD_RUN = 3    # 向後行駛
-SPRINT_STATE_COMPLETED = 4       # 競賽完成
-SPRINT_STATE_FOUL = 5            # 犯規/異常狀態
-
-# --- Sprint 機器人主控邏輯 ---
-class SprintRobot:
-    def __init__(self, serial_comm: SerialCommunication, camera_index=0):
-        self.serial_comm = serial_comm
+# --- New Vision Thread for Standalone Operation ---
+class VisionThread(threading.Thread):
+    def __init__(self, camera_index=0):
+        super().__init__()
         self.camera_index = camera_index
-        self.opencv_thread = None # 將在 initialize_camera 中實例化
-        self.target_color_range = None # 將在載入文件後設置
+        self.running = False
+        self.lock = threading.Lock()
+        self._target_data = {
+            "center": None,
+            "area": 0,
+            "frame_width": 0,
+            "frame_height": 0
+        }
+        self._color_settings = {
+            "lower": np.array([0, 0, 0]),
+            "upper": np.array([179, 255, 255]),
+            "space": 'HSV'
+        }
+        self.daemon = True
 
-        self.current_state = SPRINT_STATE_IDLE
-        self.reverse_start_time = 0
+    def set_color_properties(self, lower, upper, color_space='HSV'):
+        with self.lock:
+            self._color_settings["lower"] = np.array(lower)
+            self._color_settings["upper"] = np.array(upper)
+            self._color_settings["space"] = color_space
+        print(f"VisionThread: Color properties set for space {color_space}")
 
-        self.current_target_center = None
-        self.current_target_area = 0
-        self.current_frame_width = 0 # 來自 OpenCVThread 的實際幀寬度
+    def get_target_data(self):
+        with self.lock:
+            return self._target_data.copy()
 
-        self.competition_running = False # 控制主迴圈是否執行競賽邏輯
+    def stop(self):
+        self.running = False
 
-    def initialize_camera(self):
-        """
-        初始化 OpenCVThread 並連接信號。
-        """
-        print(f"初始化攝影機 (索引: {self.camera_index})...")
-        self.opencv_thread = OpenCVThread(self.camera_index)
+    def run(self):
+        self.running = True
+        cap = cv2.VideoCapture(self.camera_index)
+        if not cap.isOpened():
+            print(f"Error: Cannot open camera at index {self.camera_index}")
+            self.running = False
+            return
 
-        # 連接來自 OpenCVThread 的信號
-        # 我們不需要 signal_frame 在這裡顯示，但我們可以接收它來更新內部狀態。
-        # 如果您想在 SprintCompetition.py 中也顯示圖像，您可以在這裡處理 signal_frame。
-        # 例如：self.opencv_thread.signal_frame.connect(self.display_image)
-        self.opencv_thread.signal_target_data.connect(self._update_vision_data)
+        print("VisionThread: Camera opened successfully. Starting loop.")
+        while self.running:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.1)
+                continue
 
-        # 嘗試載入顏色範圍並設定到 OpenCVThread
+            h, w = frame.shape[:2]
+            
+            with self.lock:
+                lower_bound = self._color_settings["lower"]
+                upper_bound = self._color_settings["upper"]
+                color_space = self._color_settings["space"]
+
+            if color_space == 'HSV':
+                converted_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            elif color_space == 'LAB':
+                converted_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            elif color_space == 'YCrCb':
+                converted_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+            elif color_space == 'HLS':
+                converted_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
+            else:
+                converted_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+            mask = cv2.inRange(converted_frame, lower_bound, upper_bound)
+            kernel = np.ones((5, 5), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            target_center = None
+            target_area = 0
+
+            if contours:
+                largest_contour = max(contours, key=cv2.contourArea)
+                area = cv2.contourArea(largest_contour)
+                if area > 100:
+                    M = cv2.moments(largest_contour)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        target_center = (cx, cy)
+                        target_area = area
+            
+            with self.lock:
+                self._target_data["center"] = target_center
+                self._target_data["area"] = target_area
+                self._target_data["frame_width"] = w
+                self._target_data["frame_height"] = h
+
+            time.sleep(0.01)
+
+        cap.release()
+        cv2.destroyAllWindows()
+        print("VisionThread: Stopped and resources released.")
+
+
+# --- Main Sprint Robot Controller Logic ---
+class SprintRobot:
+    def __init__(self, serial_comm, camera_index=0):
+        self.serial_comm = serial_comm
+        self.vision_thread = VisionThread(camera_index)
+        self.current_state = STATE_IDLE
+        self.state_timer = 0
+        self.competition_running = False
+
+    def initialize(self):
+        print("Initializing Robot...")
         if not self._load_and_set_color_ranges(COLOR_RANGE_FILE):
-            print("警告: 未能成功載入或設置顏色範圍。機器人可能無法偵測目標。")
+            print("CRITICAL: Failed to load color ranges. Robot cannot operate.")
             return False
-
-        self.opencv_thread.start() # 啟動 OpenCV 線程
-        print("攝影機初始化成功。")
+        
+        self.vision_thread.start()
+        time.sleep(2)
+        print("Robot Initialized Successfully.")
         return True
 
     def _load_and_set_color_ranges(self, filename):
-        """
-        從 JSON 文件載入 ColorProfile 並應用到 OpenCVThread。
-        該檔案可能包含單個 ColorProfile 物件，或者是一個包含多個 ColorProfile 物件的列表。
-        如果為列表，則優先選擇 'active' 為 True 的第一個設定檔；如果都沒有 active，則選擇列表中的第一個。
-        """
         try:
-            with open(filename, 'r') as f:
+            with open(filename, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                
-                selected_profile = None
 
-                if isinstance(data, list):
-                    # 如果是列表，嘗試找到 'active' 為 True 的設定檔
-                    for profile_data in data:
-                        profile = ColorProfile.from_dict(profile_data)
-                        if profile.active:
-                            selected_profile = profile
-                            break # 找到第一個 active 的就停止
-                    
-                    # 如果列表中沒有 active 的設定檔，則使用列表中的第一個
-                    if selected_profile is None and data:
-                        selected_profile = ColorProfile.from_dict(data[0])
-                    elif selected_profile is None and not data:
-                        print(f"錯誤: 顏色範圍文件 '{filename}' 為空列表。")
-                        return False
-                elif isinstance(data, dict):
-                    # 如果是單個字典，直接解析為 ColorProfile
-                    selected_profile = ColorProfile.from_dict(data)
-                else:
-                    print(f"錯誤: '{filename}' 文件的格式不正確。期望是 ColorProfile 物件 (字典) 或包含 ColorProfile 物件的列表。")
-                    return False
+            profiles_data = data.get("profiles", [])
+            if not profiles_data:
+                print(f"Error: No profiles found in '{filename}'.")
+                return False
 
-                if selected_profile:
-                    # 從選定的 ColorProfile 中提取 HSV 範圍
-                    lower = [selected_profile.c1_min, selected_profile.c2_min, selected_profile.c3_min]
-                    upper = [selected_profile.c1_max, selected_profile.c2_max, selected_profile.c3_max]
-                    self.target_color_range = {"lower": lower, "upper": upper}
-                    self.opencv_thread.set_hsv_range(lower, upper)
-                    print(f"從 {filename} 載入並設置 HSV 範圍成功。目標顏色設定檔: '{selected_profile.name}'")
-                    return True
-                else:
-                    print(f"錯誤: 在 '{filename}' 中找不到可用的顏色設定檔。")
-                    return False
+            selected_profile_data = None
+            for p in profiles_data:
+                if p.get("active", False):
+                    selected_profile_data = p
+                    break
+            if not selected_profile_data:
+                selected_profile_data = profiles_data[0]
+
+            profile = ColorProfile.from_dict(selected_profile_data)
+            color_space = data.get("current_color_space", "HSV")
+            
+            lower = [profile.c1_min, profile.c2_min, profile.c3_min]
+            upper = [profile.c1_max, profile.c2_max, profile.c3_max]
+
+            self.vision_thread.set_color_properties(lower, upper, color_space)
+            print(f"Successfully loaded profile '{profile.name}' from '{filename}'.")
+            return True
 
         except FileNotFoundError:
-            print(f"錯誤: 找不到顏色範圍文件 '{filename}'。請確認檔案是否存在且路徑正確。")
+            print(f"Error: Color settings file not found: '{filename}'")
             return False
         except json.JSONDecodeError:
-            print(f"錯誤: 無法解析 '{filename}'。請檢查檔案內容是否為有效的 JSON 格式。")
+            print(f"Error: Could not decode JSON from '{filename}'.")
             return False
         except Exception as e:
-            print(f"載入顏色範圍文件時發生錯誤: {e}")
+            print(f"An unexpected error occurred while loading settings: {e}")
             return False
-
-    def _update_vision_data(self, target_data):
-        """
-        接收來自 OpenCVThread 的目標數據，並更新機器人的視覺狀態。
-        target_data: (target_center, target_area, bbox, frame_width, frame_height)
-        """
-        self.current_target_center, self.current_target_area, _, self.current_frame_width, _ = target_data
-        # print(f"視覺數據更新: 中心={self.current_target_center}, 面積={self.current_target_area}") # 可選：用於調試
-
-    def _calculate_robot_commands(self):
-        """
-        根據當前競賽狀態和視覺數據計算機器人指令。
-        回傳: forward_step, turn_angle, side_step
-        """
-        forward_step = 0
-        turn_angle = 0
-        side_step = 0
-
-        # 如果沒有有效的幀寬度，則停止所有動作
-        if self.current_frame_width == 0:
-            return 0, 0, 0
-
-        frame_center_x = self.current_frame_width // 2
-
-        if self.current_state == SPRINT_STATE_FORWARD_RUN:
-            if self.current_target_center and self.current_target_area > 0:
-                if self.current_target_area > TARGET_AREA_THRESHOLD_STOP:
-                    # 目標達到閾值，切換到後退狀態
-                    print(f"目標面積達到閾值 ({self.current_target_area} > {TARGET_AREA_THRESHOLD_STOP})，切換到後退狀態。")
-                    self.current_state = SPRINT_STATE_REACHED_TARGET
-                    self.reverse_start_time = time.time() # 記錄開始後退的時間
-                    forward_step = 0 # 立即停止前進
-                    turn_angle = 0
-                    side_step = 0
-                else:
-                    # 向前追蹤目標，根據面積調整速度
-                    # normalized_area = min(self.current_target_area / (TARGET_AREA_THRESHOLD_STOP * 1.5), 1.0)
-                    # # forward_step = INITIAL_FORWARD_STEP - (INITIAL_FORWARD_STEP - MIN_FORWARD_STEP) * normalized_area
-                    # # forward_step = int(max(MIN_FORWARD_STEP, forward_step))
-                    forward_step = 35
-
-                    # 根據中心點偏移調整轉彎角度和側移步長
-                    offset_x = self.current_target_center[0] - frame_center_x
-                    normalized_offset_x = offset_x / (self.current_frame_width / 2) # 歸一化偏移量
-
-                    turn_angle = -int(normalized_offset_x * MAX_TURN_ANGLE)
-                    # side_step = -int(normalized_offset_x * MAX_SIDE_STEP)
-
-                    turn_angle = max(-MAX_TURN_ANGLE, min(MAX_TURN_ANGLE, turn_angle))
-                    # side_step = max(-MAX_SIDE_STEP, min(MAX_SIDE_STEP, side_step))
-                    
-                    turn_angle = max(-MAX_TURN_ANGLE, min(MAX_TURN_ANGLE, turn_angle))
-                    side_step = 0
-            else:
-                # 前進狀態但未偵測到目標，停止或原地搜索
-                print("前進狀態但未偵測到目標，機器人停止。")
-                forward_step = 0
-                turn_angle = 0
-                side_step = 0
-
-        elif self.current_state == SPRINT_STATE_REACHED_TARGET:
-            # 停止等待，準備切換到後退
-            forward_step = 0
-            turn_angle = 0
-            side_step = 0
-            # 這裡可以加入一個短暫的停頓，確保完全停止後再後退
-            if time.time() - self.reverse_start_time > 0.5: # 停頓 0.5 秒
-                self.current_state = SPRINT_STATE_BACKWARD_RUN
-                self.reverse_start_time = time.time() # 重置後退計時
-
-        elif self.current_state == SPRINT_STATE_BACKWARD_RUN:
-            forward_step = REVERSE_STEP
-            if time.time() - self.reverse_start_time >= REVERSE_DURATION:
-                # 後退時間結束，競賽完成
-                print("後退完成，競賽結束。")
-                self.current_state = SPRINT_STATE_COMPLETED
-                forward_step = 0
-                turn_angle = 0
-                side_step = 0
-            # 如果後退時也需要橫向調整，可以在這裡加入視覺判斷
-            # 例如：檢查機器人是否偏離了後退的直線路徑 (如果比賽有起點線或指引線)
-
-        elif self.current_state == SPRINT_STATE_IDLE:
-            # 閒置狀態，等待開始指令
-            pass
-
-        elif self.current_state == SPRINT_STATE_COMPLETED:
-            # 競賽完成，機器人停止
-            pass
-
-        elif self.current_state == SPRINT_STATE_FOUL:
-            # 犯規狀態，機器人停止
-            pass
-
-        return forward_step, turn_angle, side_step
 
     def start_competition(self):
-        """
-        啟動機器人競賽主流程。
-        """
         if not self.serial_comm.ser or not self.serial_comm.ser.is_open:
-            print("錯誤：串口未連接或已關閉。請先連接串口。")
-            return False
-        if not self.opencv_thread or not self.opencv_thread.running:
-            print("錯誤：攝影機線程未運行或初始化失敗。")
-            return False
-        if not self.target_color_range:
-            print("錯誤：未載入目標顏色範圍。請先確認 color_ranges.json 存在並正確設置。")
-            return False
-
-        self.current_state = SPRINT_STATE_FORWARD_RUN
+            print("Error: Serial port not connected.")
+            return
+        if not self.vision_thread.is_alive():
+            print("Error: Vision thread is not running.")
+            return
+        
+        print("\n--- Competition Starting! ---")
         self.competition_running = True
-        print("機器人競賽開始！進入向前追蹤狀態。")
-        return True
+        self.current_state = STATE_SEARCHING
 
     def stop_competition(self):
-        """
-        停止機器人競賽主流程並發送停止指令。
-        """
-        self.competition_running = False
-        self.current_state = SPRINT_STATE_IDLE
-        self.serial_comm.send_command("run,0,0,0\n") # 發送停止指令
-        print("機器人競賽停止。")
+        # This check prevents stopping actions from running multiple times
+        if self.competition_running:
+            print("--- Stop signal received. Halting competition. ---")
+            self.competition_running = False
 
-    def run(self):
-        """
-        機器人競賽的主迴圈。
-        """
-        print("等待競賽開始指令...")
-        # 這裡可以加入一個循環，等待外部觸發 (例如按鍵、接收特定串口指令) 啟動競賽
-        # 為了簡化，我們直接在這裡啟動競賽，或者您可以手動調用 start_competition()
+    def run_main_loop(self):
+        while self.competition_running:
+            vision_data = self.vision_thread.get_target_data()
+            self._execute_state_machine(vision_data)
+            time.sleep(0.05)
+        
+        # Ensure robot is stopped when loop exits
+        print("Main loop has exited. Sending final stop command.")
+        self.serial_comm.send_command("run", [0, 0, 0])
 
-        # 等待攝像頭和串口初始化完成
-        time.sleep(3) # 給予足夠時間
 
-        if not self.start_competition():
-            print("競賽啟動失敗。")
-            self._cleanup()
-            return
+    def _execute_state_machine(self, vision_data):
+        target_center = vision_data["center"]
+        target_area = vision_data["area"]
+        frame_width = vision_data["frame_width"]
 
-        # 主控制迴圈
-        while self.competition_running or self.current_state == SPRINT_STATE_BACKWARD_RUN:
-            forward_step, turn_angle, side_step = self._calculate_robot_commands()
-            command_str = f"run,{forward_step},{turn_angle},{side_step}\n"
-            self.serial_comm.send_command(command_str)
-            # print(f"狀態: {self.current_state}, 指令: {command_str.strip()}") # 用於調試
+        fwd = 0
+        turn = 0
+        
+        if self.current_state == STATE_SEARCHING:
+            print("State: SEARCHING... looking for target.")
+            if target_center:
+                print("Target found. Switching to FORWARD_RUN.")
+                self.current_state = STATE_FORWARD_RUN
+            else:
+                fwd = 0
+                turn = 5 
 
-            if self.current_state == SPRINT_STATE_COMPLETED:
-                print("競賽已完成，停止運行。")
-                self.stop_competition()
-                break # 退出主循環
+        elif self.current_state == STATE_FORWARD_RUN:
+            if not target_center or frame_width == 0:
+                print("Target lost. Switching back to SEARCHING.")
+                self.current_state = STATE_SEARCHING
+                return
 
-            time.sleep(0.05) # 控制迴圈頻率，例如 20 FPS (每 50ms 執行一次)
+            if target_area > TARGET_AREA_THRESHOLD_STOP:
+                print(f"Target Reached! Area: {target_area}. Switching to REACHED_TARGET.")
+                self.current_state = STATE_REACHED_TARGET
+                return
+            
+            frame_center_x = frame_width / 2
+            offset = target_center[0] - frame_center_x
+            normalized_offset = offset / frame_center_x 
+            
+            fwd = FORWARD_SPEED
+            turn = -int(normalized_offset * MAX_TURN_SPEED)
+            
+            print(f"State: FORWARD_RUN | Area: {target_area:5.0f} | Turn: {turn:3d}")
 
-        print("競賽程式結束。")
-        self._cleanup()
+        elif self.current_state == STATE_REACHED_TARGET:
+            print("State: REACHED_TARGET. Preparing to reverse.")
+            self.state_timer = time.time()
+            self.current_state = STATE_BACKWARD_RUN
+            fwd = 0
+            turn = 0
 
-    def _cleanup(self):
-        """清理資源"""
-        if self.opencv_thread:
-            self.opencv_thread.stop()
+        elif self.current_state == STATE_BACKWARD_RUN:
+            if time.time() - self.state_timer > REVERSE_DURATION_S:
+                print("Reverse complete. Switching to COMPLETED.")
+                self.current_state = STATE_COMPLETED
+                return
+            
+            print(f"State: BACKWARD_RUN")
+            fwd = REVERSE_SPEED
+            turn = 0
+        
+        elif self.current_state == STATE_COMPLETED:
+            print("State: COMPLETED. Mission finished.")
+            fwd = 0
+            turn = 0
+            self.stop_competition()
+
+        self.serial_comm.send_command("run", [fwd, turn, 0])
+
+    def cleanup(self):
+        print("Cleaning up resources...")
+        if self.vision_thread.is_alive():
+            self.vision_thread.stop()
+            self.vision_thread.join(timeout=2)
         if self.serial_comm:
             self.serial_comm.close()
-        cv2.destroyAllWindows() # 關閉所有 OpenCV 窗口 (如果有的話)
+        print("Cleanup complete.")
 
-
-# --- 主執行區塊 ---
+# --- Main Execution Block ---
 if __name__ == "__main__":
-    # 1. 偵測並選擇串口 (僅在沒有明確指定 SERIAL_PORT 時)
     if SERIAL_PORT is None:
-        print("正在偵測可用串口...")
-        ports = SerialCommunication.list_available_ports()
-        if not ports:
-            print("錯誤：未偵測到任何可用串口。程式即將結束。")
+        print("Detecting available serial ports...")
+        available_ports = SerialCommunication.get_available_ports()
+        if not available_ports:
+            print("ERROR: No serial ports detected. Please connect the robot.")
             exit()
-        else:
-            print("可用串口：")
-            for i, (port, desc, hwid) in enumerate(ports):
-                print(f"[{i}] {port}: {desc}")
-            selected_index = -1
-            while selected_index < 0 or selected_index >= len(ports):
-                try:
-                    user_input = input(f"請輸入要連接的串口編號 (0-{len(ports)-1}): ")
-                    selected_index = int(user_input)
-                except ValueError:
-                    print("輸入無效，請輸入數字。")
-            SERIAL_PORT = ports[selected_index][0]
-            print(f"已選擇串口：{SERIAL_PORT}")
-    else:
-        print(f"使用預設串口：{SERIAL_PORT}")
+        
+        print("Available ports:")
+        for i, port in enumerate(available_ports):
+            print(f"  [{i}] {port}")
+        
+        selected_index = -1
+        while not (0 <= selected_index < len(available_ports)):
+            try:
+                choice = input(f"Select port number (0-{len(available_ports)-1}): ")
+                selected_index = int(choice)
+            except (ValueError, IndexError):
+                print("Invalid input. Please enter a valid number.")
+        SERIAL_PORT = available_ports[selected_index]
 
-    # 2. 初始化序列通訊
-    print(f"正在初始化序列通訊 (埠：{SERIAL_PORT}, 鮑率：{BAUDRATE})...")
-    serial_controller = SerialCommunication(port=SERIAL_PORT, baudrate=BAUDRATE)
-    if not serial_controller.ser or not serial_controller.ser.is_open:
-        print(f"錯誤：無法連接到序列埠 {SERIAL_PORT}。請檢查機器人連線並確認埠設定。程式即將結束。")
-        exit()
-    print("序列通訊初始化成功。")
-
-    # 3. 建立並執行 SprintRobot
-    sprint_robot = SprintRobot(serial_controller, CAMERA_INDEX)
-    if not sprint_robot.initialize_camera():
-        print("攝影機初始化失敗，程式即將結束。")
-        serial_controller.close()
-        exit()
-
-    # 為了方便在競賽開始前準備，程式在這裡等待使用者輸入
-    input("按下 Enter 鍵啟動機器人競賽...")
-    sprint_robot.run() # 啟動競賽主迴圈
+    print(f"Connecting to {SERIAL_PORT} at {BAUDRATE}")
